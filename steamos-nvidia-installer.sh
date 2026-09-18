@@ -77,6 +77,20 @@
 #                      (8GiB); Valve ships 5120. Applies to both a fresh
 #                      "all" install and an existing install's "system"
 #                      repair-time grow.
+#   --no-gamescope     Skip the gamescope GBM-scanout patch (on by default).
+#                      NVIDIA's display engine needs physically contiguous
+#                      scan-out memory but gamescope allocates its scanout
+#                      buffers through Vulkan, which lands them on scattered
+#                      vidmem pages — the severe flicker/corruption above
+#                      2560x1440@120 with HDR (NVIDIA forum thread 295314).
+#                      By default this script builds NightHammer1000's
+#                      poc/gamescope-gbm-route gamescope (GBM scanout
+#                      allocations, gated behind gamescope_drm_gbm_scanout=1),
+#                      installs it over the stock binary (kept as
+#                      gamescope.stock) and, in selfheal mode, reapplies it
+#                      on every OS update — reinstalling the pinned build,
+#                      or rebuilding the same commit against the new OS if
+#                      a library soname changed.
 #
 # Host needs: Arch-ish Linux, losetup, btrfs-progs, rsync, curl, kmod, zstd,
 # python3, readelf (binutils).
@@ -93,6 +107,25 @@ log()  { printf '\e[1;35m[nvidia-usb]\e[0m %s\n' "$*"; }
 warn() { printf '\e[1;33m[warn]\e[0m %s\n' "$*" >&2; }
 die()  { printf '\e[1;31m[fail]\e[0m %s\n' "$*" >&2; exit 1; }
 
+# ------------------------------------------ gamescope GBM-scanout fork
+# See --no-gamescope in the header. Env-overridable for testing a different
+# fork/branch; the commit actually built is pinned into the image for the
+# self-heal rebuild path.
+GS_REPO="${GS_REPO:-https://github.com/NightHammer1000/gamescope.git}"
+GS_BRANCH="${GS_BRANCH:-poc/gamescope-gbm-route}"
+GS_ENV_FLAG='gamescope_drm_gbm_scanout=1'
+# Build deps, resolvable from the image's own frozen mirror (no current-Arch
+# libraries enter the image — the build stays in the overlay). Also recorded
+# in gamescope.conf for the on-device rebuild fallback. Anything the image
+# already ships is a --needed no-op.
+GS_DEPS="base-devel git meson ninja cmake pkgconf glslang vulkan-headers \
+wayland-protocols benchmark glm hwdata libavif libdecor libei luajit sdl2 \
+seatd libdisplay-info libinput libpipewire pipewire lcms2 libcap libx11 \
+libxcb libxcomposite libxdamage libxext libxfixes libxrender libxres \
+libxtst libxmu libxxf86vm libxkbcommon libxcursor libxi libdrm wayland \
+pixman vulkan-icd-loader xcb-util-errors xcb-util-wm"
+GS_DEPS="$(echo $GS_DEPS)"   # collapse the line continuations' whitespace
+
 # ------------------------------------------------------------------- args
 UPDATE_MODE=selfheal   # selfheal | hold | stock
 ADD_INSTALLER=1
@@ -103,6 +136,7 @@ WORKDIR=""
 IMG=""
 TARGET_ROOT_MIB=8192   # MiB per rootfs-A/B slot; Valve ships 5120
 GROW_ROOTFS=0          # off by default -- --target-root-mib implies it
+PATCH_GAMESCOPE=1      # GBM-scanout gamescope (NVIDIA HDR flicker fix)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -115,7 +149,8 @@ while [[ $# -gt 0 ]]; do
     --workdir)         WORKDIR="${2:?--workdir needs an argument}"; shift ;;
     --grow-rootfs)     GROW_ROOTFS=1 ;;
     --target-root-mib) TARGET_ROOT_MIB="${2:?--target-root-mib needs an argument}"; GROW_ROOTFS=1; shift ;;
-    -h|--help)         sed -n '2,85p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-gamescope)    PATCH_GAMESCOPE=0 ;;
+    -h|--help)         sed -n '2,100p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "Unknown option: $1" ;;
     *)                 IMG="$1" ;;
   esac
@@ -140,7 +175,7 @@ if [[ -z "$IMG" ]]; then
   esac
 fi
 [[ -f "$IMG" ]] || die "Image not found: $IMG"
-for tool in losetup blkid btrfs rsync curl depmod sed awk tar zstd pacman python3 readelf; do
+for tool in losetup blkid btrfs rsync curl depmod sed awk tar zstd pacman python3 readelf cmp; do
   command -v "$tool" >/dev/null || die "Missing host tool: $tool"
 done
 
@@ -410,6 +445,8 @@ if compgen -G "$UPPER/usr/lib/holo/pacmandb/local/nvidia-utils-[0-9]*" >/dev/nul
     log "Cached build is nvidia $CACHED_VER but $DRIVER_VERSION is pinned — clearing the build overlay"
     rm -rf "${UPPER:?}" "${OVLWORK:?}"
     mkdir -p "$UPPER" "$OVLWORK"
+    # the gamescope toolchain record describes THAT overlay — clear it too
+    rm -f "$WORKDIR/gs-toolchain.txt"
   fi
 fi
 
@@ -490,6 +527,48 @@ in_chroot "pacman --config $PACCONF -Sy" || warn "pacman -Sy failed — trying t
 in_chroot "pacman --config $PACCONF -S $PACOPTS lib32-libxkbcommon" \
   || die "could not install lib32-libxkbcommon from the image's frozen mirror"
 
+# ----------------------------------------------- gamescope GBM scanout
+# Built in the same overlay chroot as the driver, so it links against the
+# image's exact libraries. The toolchain packages this pulls in are recorded
+# in gs-toolchain.txt and subtracted from the driver payload diff below —
+# the record is cumulative across cached-overlay reruns (the chroot pacman
+# db keeps them installed, so a fresh pre/post diff would come out empty)
+# and is cleared together with the overlay. Ordering guarantees it never
+# swallows a real driver dependency: everything the driver needs is
+# installed above, so it is already in gs-pre and never enters the diff.
+GS_TOOLCHAIN="$WORKDIR/gs-toolchain.txt"
+touch "$GS_TOOLCHAIN"
+GS_COMMIT=""
+if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
+  [[ -x "$MNT/usr/bin/gamescope" ]] || die "no /usr/bin/gamescope in the image — cannot apply the GBM-scanout patch"
+  log "Installing gamescope build toolchain into the overlay (image's frozen mirror)"
+  in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORKDIR/gs-pre.txt"
+  in_chroot "pacman --config $PACCONF -S $PACOPTS $GS_DEPS" \
+    || die "could not install gamescope build deps from the image's frozen mirror"
+  in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORKDIR/gs-post.txt"
+  LC_ALL=C comm -13 "$WORKDIR/gs-pre.txt" "$WORKDIR/gs-post.txt" \
+    | cat - "$GS_TOOLCHAIN" | LC_ALL=C sort -u > "$GS_TOOLCHAIN.tmp"
+  mv "$GS_TOOLCHAIN.tmp" "$GS_TOOLCHAIN"
+
+  log "Building gamescope GBM-scanout fork ($GS_BRANCH — a few minutes)"
+  in_chroot "set -e
+    rm -rf /tmp/gamescope
+    cd /tmp
+    git clone --depth=1 --recurse-submodules --shallow-submodules \
+      -b '$GS_BRANCH' '$GS_REPO' gamescope
+    cd gamescope
+    git rev-parse HEAD > .commit
+    meson setup build --buildtype=release
+    ninja -C build src/gamescope" \
+    || die "gamescope build failed (check output above)"
+  [[ -x "$MERGED/tmp/gamescope/build/src/gamescope" ]] \
+    || die "gamescope build produced no binary"
+  GS_COMMIT="$(tr -d '[:space:]' < "$MERGED/tmp/gamescope/.commit")"
+  [[ "$GS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "could not capture the built gamescope commit"
+  cp "$MERGED/tmp/gamescope/build/src/gamescope" "$WORKDIR/gamescope-gbm"
+  log "Built gamescope $GS_BRANCH @ $GS_COMMIT"
+fi
+
 # "Before" = the pristine image's own pacman db (read directly, host-side) —
 # NOT the chroot's, whose db carries installs cached in the overlay upper
 # layer from previous runs and would make the diff come out empty.
@@ -502,7 +581,7 @@ in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORKDIR/pkgs-after.txt"
 # compiled module is copied from /usr/lib/modules separately.
 BUILD_ONLY_RE='^(dkms|nvidia-open-dkms|patch|gcc|gcc-libs|make|binutils|libisl|libmpc|mpfr|pahole|python-setuptools|linux-neptune.*-headers|.*-headers)$'
 mapfile -t NEW_PKGS < <(LC_ALL=C comm -13 "$WORKDIR/pkgs-before.txt" "$WORKDIR/pkgs-after.txt" \
-                        | grep -Ev "$BUILD_ONLY_RE")
+                        | grep -Ev "$BUILD_ONLY_RE" | grep -vxFf "$GS_TOOLCHAIN")
 [[ ${#NEW_PKGS[@]} -gt 0 ]] || die "Payload package list came out empty — check $WORKDIR/pkgs-*.txt"
 log "Payload packages: ${NEW_PKGS[*]}"
 
@@ -578,6 +657,21 @@ if [[ -f "$MNT/usr/bin/steam" ]] \
     || die "steam wrapper patch failed"
 else
   warn "OOBE steam wrapper wipe not found — skipping (upstream wrapper may have changed)"
+fi
+
+# -------------------------------------------- gamescope GBM install
+if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
+  log "Installing GBM-scanout gamescope into the image (stock kept as gamescope.stock)"
+  [[ -f "$MNT/usr/bin/gamescope.stock" ]] \
+    || cp -a "$MNT/usr/bin/gamescope" "$MNT/usr/bin/gamescope.stock"
+  install -m755 "$WORKDIR/gamescope-gbm" "$MNT/usr/bin/gamescope"
+  # The GBM route is gated behind this env var; it is inert for stock
+  # gamescope, so asserting it everywhere is safe. Both the PAM path
+  # (/etc/environment) and systemd user sessions (environment.d) get it.
+  grep -qs "^${GS_ENV_FLAG%%=*}=" "$MNT/etc/environment" \
+    || echo "$GS_ENV_FLAG" >> "$MNT/etc/environment"
+  mkdir -p "$MNT/etc/environment.d"
+  printf '%s\n' "$GS_ENV_FLAG" > "$MNT/etc/environment.d/60-nvidia-gbm-scanout.conf"
 fi
 
 # --------------------------------------------------------- update strategy
@@ -870,6 +964,17 @@ if [[ $rc -eq 0 && $is_apply -eq 1 ]]; then
   echo "Update staged. Building NVIDIA driver for the new OS (10-20 min, do NOT power off)..." >&2
   if "$REPATCH" other >> "$LOG" 2>&1; then
     echo "NVIDIA driver installed into the updated OS. Safe to reboot." >&2
+    # Reapply the GBM-scanout gamescope. NON-fatal by design: stock
+    # gamescope boots fine (it just flickers at high HDR modes), so this
+    # must never cancel an OS update. Absent when built --no-gamescope.
+    if [[ -x /usr/lib/steamos-nvidia/gamescope-repatch.sh ]]; then
+      echo "Reapplying patched gamescope to the new OS..." >&2
+      if ! /usr/lib/steamos-nvidia/gamescope-repatch.sh other >> "$LOG" 2>&1; then
+        echo "!! gamescope repatch failed — the updated OS will run STOCK gamescope" >&2
+        echo "!! (high-res HDR flicker returns). Details: $LOG" >&2
+        echo "!! Retry: sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other" >&2
+      fi
+    fi
     # make sure the freshly patched slot is bootable (clears an
     # image-invalid left by a previously cancelled update)
     edit_other_confs -e 's/^image-invalid:.*/image-invalid: 0/'
@@ -888,6 +993,203 @@ fi
 exit $rc
 WRAP
   chmod 755 "$MNT/usr/bin/steamos-update"
+
+  # ---- gamescope self-heal: pinned record + prebuilt binary + repatch tool.
+  # Everything lives in /usr/lib/steamos-nvidia, which repatch.sh already
+  # propagates wholesale into each new slot (along with the update wrapper),
+  # so the gamescope machinery survives every update with no extra plumbing.
+  if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
+    log "Installing gamescope self-heal (reapplied on every OS update)"
+    cat > "$MNT/usr/lib/steamos-nvidia/gamescope.conf" <<EOF
+# Written by steamos-nvidia-installer at image build time.
+# gamescope-repatch.sh reinstalls the prebuilt binary on every OS update and
+# rebuilds this exact commit from source if the new OS breaks its linkage.
+GS_REPO="$GS_REPO"
+GS_BRANCH="$GS_BRANCH"
+GS_COMMIT="$GS_COMMIT"
+GS_ENV_FLAG="$GS_ENV_FLAG"
+GS_DEPS="$GS_DEPS"
+EOF
+    chmod 644 "$MNT/usr/lib/steamos-nvidia/gamescope.conf"
+    install -m644 "$WORKDIR/gamescope-gbm" "$MNT/usr/lib/steamos-nvidia/gamescope-gbm.bin"
+
+    cat > "$MNT/usr/lib/steamos-nvidia/gamescope-repatch.sh" <<'GSREPATCH'
+#!/bin/bash
+# steamos-nvidia gamescope repatch — reapply the NightHammer GBM-scanout
+# gamescope build to another partition set (normally "other", right after an
+# OS update staged there). Modeled on repatch.sh (the driver repatch).
+#
+# Strategy, same route as the driver self-heal:
+#   1. If the slot already carries our binary → just re-assert the env flag.
+#   2. Install the prebuilt binary (pinned at image build time) and verify it
+#      links against the new slot's libraries (chroot ldd).
+#   3. If the new OS bumped a library soname and the prebuilt binary no longer
+#      links, rebuild the SAME pinned commit from source in an overlay chroot
+#      on the new slot, against that slot's own frozen mirror.
+#
+# Unlike the driver repatch this must NEVER cancel an update: stock gamescope
+# boots fine, it just flickers at >1440p120 HDR. Callers treat rc!=0 as a
+# warning only.
+set -euo pipefail
+
+PARTSET="${1:-other}"
+DIR=/usr/lib/steamos-nvidia
+log()  { echo "[gs-repatch] $*"; }
+fail() { echo "[gs-repatch] FAIL: $*" >&2; exit 1; }
+
+# shellcheck disable=SC1091
+source "$DIR/gamescope.conf"
+: "${GS_REPO:?gamescope.conf missing GS_REPO}"
+: "${GS_COMMIT:?gamescope.conf missing GS_COMMIT}"
+: "${GS_ENV_FLAG:?gamescope.conf missing GS_ENV_FLAG}"
+BIN="$DIR/gamescope-gbm.bin"
+[[ -f "$BIN" ]] || fail "prebuilt binary $BIN missing"
+
+ROOTDEV="/dev/disk/by-partsets/$PARTSET/rootfs"
+[[ -b "$ROOTDEV" ]] || fail "partset '$PARTSET' not found"
+
+NEWROOT="$(mktemp -d /tmp/gs-repatch.XXXXXX)"
+WORK=""
+WORKIMG=/home/.steamos-nvidia-gswork.img
+MERGED=""
+WAS_RO=0
+
+cleanup() {
+  set +e
+  if [[ -n "$MERGED" ]]; then
+    for m in "$MERGED"/dev/pts "$MERGED"/dev "$MERGED"/sys "$MERGED"/proc "$MERGED"; do
+      mountpoint -q "$m" 2>/dev/null && { umount -R "$m" 2>/dev/null || umount -Rl "$m" 2>/dev/null; }
+    done
+  fi
+  [[ -n "$WORK" ]] && mountpoint -q "$WORK" 2>/dev/null && umount "$WORK" 2>/dev/null
+  rm -f "$WORKIMG"
+  if mountpoint -q "$NEWROOT" 2>/dev/null; then
+    btrfs filesystem sync "$NEWROOT" 2>/dev/null
+    [[ $WAS_RO -eq 1 ]] && btrfs property set "$NEWROOT" ro true 2>/dev/null
+    umount -R "$NEWROOT" 2>/dev/null || umount -Rl "$NEWROOT" 2>/dev/null
+  fi
+  rmdir "$NEWROOT" "$WORK" 2>/dev/null
+}
+trap cleanup EXIT
+
+log "Mounting $ROOTDEV"
+mount -o compress-force=zstd:3 "$ROOTDEV" "$NEWROOT"
+if [[ "$(btrfs property get "$NEWROOT" ro)" == "ro=true" ]]; then
+  WAS_RO=1; btrfs property set "$NEWROOT" ro false
+fi
+[[ -f "$NEWROOT/usr/bin/gamescope" ]] || fail "no gamescope in $PARTSET rootfs"
+
+apply_env() {
+  # Written into the slot's rootfs /etc (the etc-overlay lower layer), same
+  # as at image build time — independent of the slot's var overlay state.
+  grep -qs "^${GS_ENV_FLAG%%=*}=" "$NEWROOT/etc/environment" \
+    || echo "$GS_ENV_FLAG" >> "$NEWROOT/etc/environment"
+  mkdir -p "$NEWROOT/etc/environment.d"
+  printf '%s\n' "$GS_ENV_FLAG" > "$NEWROOT/etc/environment.d/60-nvidia-gbm-scanout.conf"
+}
+
+# The env flag is inert for stock gamescope, so it is safe to assert always.
+apply_env
+
+if cmp -s "$BIN" "$NEWROOT/usr/bin/gamescope"; then
+  log "patched gamescope already present in $PARTSET — nothing to do"
+  exit 0
+fi
+
+# try_install <binary> — put it in place and verify it resolves against the
+# slot's own libraries. Restores stock on link failure.
+try_install() {
+  [[ -f "$NEWROOT/usr/bin/gamescope.stock" ]] \
+    || cp -a "$NEWROOT/usr/bin/gamescope" "$NEWROOT/usr/bin/gamescope.stock"
+  install -m755 "$1" "$NEWROOT/usr/bin/gamescope"
+  local missing
+  missing="$(chroot "$NEWROOT" /usr/bin/ldd /usr/bin/gamescope 2>&1 | grep 'not found' || true)"
+  if [[ -n "$missing" ]]; then
+    log "binary does not link in $PARTSET:"
+    echo "$missing" | sed 's/^/[gs-repatch]   /'
+    cp -a "$NEWROOT/usr/bin/gamescope.stock" "$NEWROOT/usr/bin/gamescope"
+    return 1
+  fi
+  return 0
+}
+
+if try_install "$BIN"; then
+  log "OK — prebuilt patched gamescope ($GS_COMMIT) installed into $PARTSET"
+  exit 0
+fi
+
+# ------------------------------------------------------- rebuild from source
+log "Prebuilt binary incompatible with the new OS — rebuilding pinned commit from source (takes a while)"
+
+# Overlay build chroot on the new slot. /home is casefolded ext4, which
+# overlayfs rejects as upperdir — so the workspace lives in a plain ext4
+# loopback image on /home (same trick as the driver repatch).
+WORK="$(mktemp -d /tmp/gs-build.XXXXXX)"
+rm -f "$WORKIMG"
+truncate -s 8G "$WORKIMG"
+mkfs.ext4 -q -F "$WORKIMG"
+mount -o loop "$WORKIMG" "$WORK"
+UPPER="$WORK/upper"; OVLWORK="$WORK/ovlwork"; MERGED="$WORK/merged"
+mkdir -p "$UPPER" "$OVLWORK" "$MERGED"
+
+mount -t overlay overlay \
+  -o "index=off,lowerdir=$NEWROOT,upperdir=$UPPER,workdir=$OVLWORK" "$MERGED"
+mount -t proc proc "$MERGED/proc"
+mount --rbind /sys "$MERGED/sys"; mount --make-rslave "$MERGED/sys"
+mount --rbind /dev "$MERGED/dev"; mount --make-rslave "$MERGED/dev"
+rm -f "$MERGED/etc/resolv.conf"; cp -L /etc/resolv.conf "$MERGED/etc/resolv.conf"
+in_chroot() { chroot "$MERGED" /bin/bash -c "$*"; }
+
+[[ -d "$MERGED/etc/pacman.d/gnupg/private-keys-v1.d" ]] \
+  || in_chroot "pacman-key --init && pacman-key --populate" || true
+
+log "Installing build deps from the slot's own frozen mirror"
+in_chroot "pacman -Sy" || fail "pacman -Sy failed in build chroot"
+if ! in_chroot "pacman -S --noconfirm --needed $GS_DEPS"; then
+  # unattended context: keyring drift must not kill the repatch — packages
+  # come over HTTPS from Valve's own mirror
+  log "WARNING: dep install failed (keyring?) — retrying with signature checks off"
+  sed 's/^SigLevel.*/SigLevel = Never/' "$MERGED/etc/pacman.conf" > "$MERGED/tmp/pacman-nosig.conf"
+  in_chroot "pacman --config /tmp/pacman-nosig.conf -S --noconfirm --needed $GS_DEPS" \
+    || fail "build dependency install failed"
+fi
+
+log "Fetching pinned gamescope source $GS_COMMIT"
+in_chroot "set -e
+  rm -rf /opt/gsbuild && mkdir -p /opt/gsbuild && cd /opt/gsbuild
+  git init -q gamescope && cd gamescope
+  git remote add origin '$GS_REPO'
+  if git fetch -q --depth=1 origin '$GS_COMMIT'; then
+    git checkout -q FETCH_HEAD
+  else
+    # host refused fetch-by-sha — fall back to the branch tip
+    git fetch -q --depth=50 origin '$GS_BRANCH'
+    git checkout -q '$GS_COMMIT' || git checkout -q FETCH_HEAD
+  fi
+  git submodule update --init --recursive --depth=1 || git submodule update --init --recursive
+" || fail "source fetch failed"
+
+log "Building gamescope"
+in_chroot "cd /opt/gsbuild/gamescope && meson setup build --buildtype=release && ninja -C build src/gamescope" \
+  || fail "gamescope build failed (see log above)"
+
+REBUILT="$MERGED/opt/gsbuild/gamescope/build/src/gamescope"
+[[ -x "$REBUILT" ]] || fail "build produced no binary"
+cp "$REBUILT" "$NEWROOT/tmp/gamescope-rebuilt.$$"
+
+if try_install "$NEWROOT/tmp/gamescope-rebuilt.$$"; then
+  rm -f "$NEWROOT/tmp/gamescope-rebuilt.$$"
+  # future updates reuse the rebuilt binary directly instead of rebuilding
+  cp "$NEWROOT/usr/bin/gamescope" "$DIR/gamescope-gbm.bin.new" \
+    && mv "$DIR/gamescope-gbm.bin.new" "$DIR/gamescope-gbm.bin" || true
+  log "OK — rebuilt patched gamescope installed into $PARTSET (prebuilt cache refreshed)"
+  exit 0
+fi
+rm -f "$NEWROOT/tmp/gamescope-rebuilt.$$"
+fail "rebuilt binary still does not link — stock gamescope left in place"
+GSREPATCH
+    chmod 755 "$MNT/usr/lib/steamos-nvidia/gamescope-repatch.sh"
+  fi
 fi
 
 # ----------------------------------------------------- kernel cmdline
@@ -1065,6 +1367,17 @@ if [[ $UPDATE_MODE == selfheal ]]; then
   grep -q "^DRIVER_VERSION=\"$DRIVER_VERSION\"" "$MNT/usr/lib/steamos-nvidia/driver.conf" || die "driver.conf missing/wrong"
   [[ -L "$MNT/etc/systemd/system/atomupd.service" ]] && die "atomupd must NOT be masked in selfheal mode"
 fi
+if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
+  cmp -s "$WORKDIR/gamescope-gbm" "$MNT/usr/bin/gamescope" || die "gamescope in image differs from the built binary"
+  [[ -f "$MNT/usr/bin/gamescope.stock" ]] || die "stock gamescope backup missing"
+  grep -q "^$GS_ENV_FLAG\$" "$MNT/etc/environment" || die "gamescope env flag missing from /etc/environment"
+  if [[ $UPDATE_MODE == selfheal ]]; then
+    [[ -x "$MNT/usr/lib/steamos-nvidia/gamescope-repatch.sh" ]] || die "gamescope-repatch.sh missing"
+    cmp -s "$WORKDIR/gamescope-gbm" "$MNT/usr/lib/steamos-nvidia/gamescope-gbm.bin" || die "self-heal gamescope binary differs"
+    grep -q "^GS_COMMIT=\"$GS_COMMIT\"" "$MNT/usr/lib/steamos-nvidia/gamescope.conf" || die "gamescope.conf commit pin wrong"
+    grep -q 'gamescope-repatch' "$MNT/usr/bin/steamos-update" || die "update wrapper missing the gamescope hook"
+  fi
+fi
 compgen -G "$MNT/usr/lib/firmware/nvidia/*/gsp_*.bin" >/dev/null || warn "GSP firmware not found — nvidia-open needs it"
 [[ -f "$MNT/usr/share/vulkan/icd.d/nvidia_icd.json" ]] || warn "Vulkan ICD json missing"
 AVAIL_AFTER="$(df -m --output=avail "$MNT" | tail -1 | tr -d ' ')"
@@ -1088,11 +1401,21 @@ cat <<EOF
 
   Driver:  nvidia-open (DKMS) $NVIDIA_VER for kernel $KVER
            (latest Arch at build time, pinned — Valve's mirror only has 575.x)
+$( if [[ $PATCH_GAMESCOPE -eq 1 ]]; then echo "  Gamescope: GBM-scanout fork $GS_BRANCH
+           @ $GS_COMMIT
+           (fixes the >1440p120 HDR flicker on NVIDIA; stock binary kept as
+           /usr/bin/gamescope.stock, enabled via $GS_ENV_FLAG)"
+   else echo "  Gamescope: stock (built with --no-gamescope)"; fi )
 $( case $UPDATE_MODE in
      selfheal) echo "  Updates: SELF-HEALING — updating from within Steam works; the SAME
            pinned driver is rebuilt for each new OS version automatically
            (adds 10-20 min per update; failed rebuilds cancel the update,
-           system stays working). For a NEWER driver later: rerun this
+           system stays working).$( [[ $PATCH_GAMESCOPE -eq 1 ]] && echo "
+           The patched gamescope is reapplied on every update too — and
+           rebuilt against the new OS if its libraries changed; a gamescope
+           failure never blocks an update (the slot then runs stock
+           gamescope until: sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other)." )
+           For a NEWER driver later: rerun this
            script and reinstall from the fresh USB image." ;;
      hold)     echo "  Updates: OS updates HELD (atomupd + OOBE migration masked, CLIs stubbed)." ;;
      stock)    echo "  Updates: STOCK behaviour — an OS update will REMOVE the NVIDIA driver!" ;;

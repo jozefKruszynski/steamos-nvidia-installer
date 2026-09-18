@@ -140,6 +140,12 @@ automatically rebuilt for the new version before the reboot prompt appears
 the update is cancelled and the machine keeps booting the current working
 system — it fails safe.
 
+The patched gamescope (see below) is reapplied to the new OS in the same
+pass: the pinned build is reinstalled, or rebuilt from source against the
+new OS if a library changed. A gamescope failure never blocks an update —
+the new OS then runs stock gamescope (the HDR flicker returns) until
+`sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other` succeeds.
+
 To move to a **different driver** later, rebuild the USB image (each run
 re-resolves the driver — latest by default, or whatever `--driver` names)
 and reinstall using the **Upgrade** icon. The installed system stays on the
@@ -176,6 +182,32 @@ system's Quick Access menu, no USB stick, no repair image, no reinstall, no rebo
 you're actually ready for one. Once the system has the extra headroom, install the plugin
 and switch driver versions at will, without ever touching a USB stick again.
 
+## Gamescope GBM scanout (NVIDIA HDR flicker fix, on by default)
+
+NVIDIA's display engine needs physically contiguous scan-out memory, but
+gamescope allocates its scanout buffers through Vulkan, which backs them
+with scattered vidmem pages — the severe flicker/corruption at modes above
+2560x1440@120Hz with HDR enabled
+([NVIDIA forum thread](https://forums.developer.nvidia.com/t/295314),
+[root cause](https://forums.developer.nvidia.com/t/display-modes-above-2560x1440p-120hz-with-hdr-enabled-cause-flickering-corruption-within-gamescope-session/295314/27)).
+
+By default the build compiles
+[NightHammer1000's `poc/gamescope-gbm-route`](https://github.com/NightHammer1000/gamescope/tree/poc/gamescope-gbm-route)
+gamescope — GBM-allocated (contiguous) scanout buffers, modeled on KWin —
+inside the same build chroot, so it links against the image's exact
+libraries. It replaces `/usr/bin/gamescope` (stock kept as
+`gamescope.stock`) and is activated by `gamescope_drm_gbm_scanout=1`,
+set in the image's `/etc/environment` and `/etc/environment.d/`. Remove
+that variable (or restore `gamescope.stock`) to revert on a live system.
+The commit actually built is pinned into
+`/usr/lib/steamos-nvidia/gamescope.conf` and the binary stored next to it,
+which is what the self-healing update path reinstalls.
+
+Pass `--no-gamescope` for stock gamescope. Note the fork author recommends
+forcing composition for games that scan out directly (the branch does not
+force it yet), and `git`, `meson`, `ninja` and friends are pulled from the
+image's own frozen mirror — nothing from current Arch enters the image.
+
 ## All options
 
 ```
@@ -191,6 +223,8 @@ and switch driver versions at will, without ever touching a USB stick again.
                         default; implied by --target-root-mib).
 --target-root-mib MIB   Size rootfs-A/B are grown to when --grow-rootfs is
                         active (default 8192 = 8GiB; Valve ships 5120).
+--no-gamescope          Skip the gamescope GBM-scanout patch (see above);
+                        the image then ships stock gamescope.
 ```
 
 ## Troubleshooting
