@@ -543,7 +543,13 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
   [[ -x "$MNT/usr/bin/gamescope" ]] || die "no /usr/bin/gamescope in the image — cannot apply the GBM-scanout patch"
   log "Installing gamescope build toolchain into the overlay (image's frozen mirror)"
   in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORKDIR/gs-pre.txt"
-  in_chroot "pacman --config $PACCONF -S $PACOPTS $GS_DEPS" \
+  # NO --needed here: many of these are runtime packages the image already
+  # ships REGISTERED in the pacman db but with their development files
+  # (headers, pkg-config .pc) pruned from the rootfs — --needed skips them
+  # and meson then can't find x11/pipewire/hwdata. An unconditional
+  # reinstall restores the dev files into the overlay (never the image:
+  # already-installed packages don't enter the payload diff below).
+  in_chroot "pacman --config $PACCONF -S --noconfirm $GS_DEPS" \
     || die "could not install gamescope build deps from the image's frozen mirror"
   in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORKDIR/gs-post.txt"
   LC_ALL=C comm -13 "$WORKDIR/gs-pre.txt" "$WORKDIR/gs-post.txt" \
@@ -1145,12 +1151,15 @@ in_chroot() { chroot "$MERGED" /bin/bash -c "$*"; }
 
 log "Installing build deps from the slot's own frozen mirror"
 in_chroot "pacman -Sy" || fail "pacman -Sy failed in build chroot"
-if ! in_chroot "pacman -S --noconfirm --needed $GS_DEPS"; then
+# NO --needed: the OS ships many of these registered in the pacman db but
+# with dev files (headers, .pc) pruned — reinstall restores them (overlay
+# only; the slot's rootfs is never touched by the build chroot).
+if ! in_chroot "pacman -S --noconfirm $GS_DEPS"; then
   # unattended context: keyring drift must not kill the repatch — packages
   # come over HTTPS from Valve's own mirror
   log "WARNING: dep install failed (keyring?) — retrying with signature checks off"
   sed 's/^SigLevel.*/SigLevel = Never/' "$MERGED/etc/pacman.conf" > "$MERGED/tmp/pacman-nosig.conf"
-  in_chroot "pacman --config /tmp/pacman-nosig.conf -S --noconfirm --needed $GS_DEPS" \
+  in_chroot "pacman --config /tmp/pacman-nosig.conf -S --noconfirm $GS_DEPS" \
     || fail "build dependency install failed"
 fi
 
