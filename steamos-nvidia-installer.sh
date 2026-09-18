@@ -591,7 +591,7 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
       -b '$GS_BRANCH' '$GS_REPO' gamescope
     cd gamescope
     git rev-parse HEAD > .commit
-    meson setup build --buildtype=release
+    meson setup build --buildtype=release -Denable_tests=false
     ninja -C build src/gamescope" \
     || die "gamescope build failed (check output above)"
   [[ -x "$MERGED/tmp/gamescope/build/src/gamescope" ]] \
@@ -1229,7 +1229,7 @@ in_chroot "set -e
 " || fail "source fetch failed"
 
 log "Building gamescope"
-in_chroot "cd /opt/gsbuild/gamescope && meson setup build --buildtype=release && ninja -C build src/gamescope" \
+in_chroot "cd /opt/gsbuild/gamescope && meson setup build --buildtype=release -Denable_tests=false && ninja -C build src/gamescope" \
   || fail "gamescope build failed (see log above)"
 
 REBUILT="$MERGED/opt/gsbuild/gamescope/build/src/gamescope"
