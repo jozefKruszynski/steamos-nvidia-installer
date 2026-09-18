@@ -123,7 +123,8 @@ wayland-protocols benchmark glm hwdata libavif libdecor libei luajit sdl2 \
 seatd libdisplay-info libinput libpipewire pipewire lcms2 libcap libx11 \
 libxcb libxcomposite libxdamage libxext libxfixes libxrender libxres \
 libxtst libxmu libxxf86vm libxkbcommon libxcursor libxi libdrm wayland \
-pixman vulkan-icd-loader xcb-util-errors xcb-util-wm"
+pixman vulkan-icd-loader xcb-util-errors xcb-util-wm \
+xorgproto libxau libxdmcp"
 GS_DEPS="$(echo $GS_DEPS)"   # collapse the line continuations' whitespace
 
 # ------------------------------------------------------------------- args
@@ -551,6 +552,32 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
   # already-installed packages don't enter the payload diff below).
   in_chroot "pacman --config $PACCONF -S --noconfirm $GS_DEPS" \
     || die "could not install gamescope build deps from the image's frozen mirror"
+
+  # The reinstall above only covers the LISTED packages, but their .pc
+  # files chain further (x11.pc Requires xproto/kbproto from xorgproto,
+  # libxcb.pc requires libxau/libxdmcp, ...) into packages Valve pruned
+  # the same way. Generic fix: pacman -Qk names every registered package
+  # with files missing on disk; reinstall the ones inside the deps'
+  # dependency closure — exactly what was pruned, nothing unrelated.
+  in_chroot "pacman --config $PACCONF -S --noconfirm --needed pacman-contrib" \
+    || die "could not install pacman-contrib (pactree) from the image's frozen mirror"
+  in_chroot "for p in $GS_DEPS; do pactree -lu \"\$p\" 2>/dev/null || true; done" \
+    | LC_ALL=C sort -u > "$WORKDIR/gs-closure.txt"
+  in_chroot "pacman -Qk 2>/dev/null || true" \
+    | awk '$(NF-2) != "0" { sub(/:$/, "", $1); print $1 }' \
+    | LC_ALL=C sort -u > "$WORKDIR/gs-broken.txt"
+  mapfile -t GS_FIX < <(LC_ALL=C comm -12 "$WORKDIR/gs-closure.txt" "$WORKDIR/gs-broken.txt")
+  if [[ ${#GS_FIX[@]} -gt 0 ]]; then
+    log "Restoring ${#GS_FIX[@]} pruned packages in the deps' closure"
+    if ! in_chroot "pacman --config $PACCONF -S --noconfirm ${GS_FIX[*]}"; then
+      warn "bulk reinstall failed — retrying one package at a time"
+      for p in "${GS_FIX[@]}"; do
+        in_chroot "pacman --config $PACCONF -S --noconfirm '$p'" \
+          || warn "could not reinstall pruned package $p (continuing)"
+      done
+    fi
+  fi
+
   in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORKDIR/gs-post.txt"
   LC_ALL=C comm -13 "$WORKDIR/gs-pre.txt" "$WORKDIR/gs-post.txt" \
     | cat - "$GS_TOOLCHAIN" | LC_ALL=C sort -u > "$GS_TOOLCHAIN.tmp"
@@ -1161,6 +1188,29 @@ if ! in_chroot "pacman -S --noconfirm $GS_DEPS"; then
   sed 's/^SigLevel.*/SigLevel = Never/' "$MERGED/etc/pacman.conf" > "$MERGED/tmp/pacman-nosig.conf"
   in_chroot "pacman --config /tmp/pacman-nosig.conf -S --noconfirm $GS_DEPS" \
     || fail "build dependency install failed"
+fi
+
+# Restore the rest of the pruned dep closure (the OS strips dev files —
+# headers, .pc — from registered packages; the .pc Requires chains reach
+# beyond the listed deps). pacman -Qk names packages with missing files;
+# reinstall the ones inside the deps' dependency closure.
+in_chroot "pacman -S --noconfirm --needed pacman-contrib" \
+  || fail "could not install pacman-contrib (pactree)"
+in_chroot "for p in $GS_DEPS; do pactree -lu \"\$p\" 2>/dev/null || true; done" \
+  | LC_ALL=C sort -u > "$WORK/gs-closure.txt"
+in_chroot "pacman -Qk 2>/dev/null || true" \
+  | awk '$(NF-2) != "0" { sub(/:$/, "", $1); print $1 }' \
+  | LC_ALL=C sort -u > "$WORK/gs-broken.txt"
+mapfile -t GS_FIX < <(LC_ALL=C comm -12 "$WORK/gs-closure.txt" "$WORK/gs-broken.txt")
+if [[ ${#GS_FIX[@]} -gt 0 ]]; then
+  log "Restoring ${#GS_FIX[@]} pruned packages in the deps' closure"
+  if ! in_chroot "pacman -S --noconfirm ${GS_FIX[*]}"; then
+    log "WARNING: bulk reinstall failed — retrying one package at a time"
+    for p in "${GS_FIX[@]}"; do
+      in_chroot "pacman -S --noconfirm '$p'" \
+        || log "WARNING: could not reinstall pruned package $p (continuing)"
+    done
+  fi
 fi
 
 log "Fetching pinned gamescope source $GS_COMMIT"
