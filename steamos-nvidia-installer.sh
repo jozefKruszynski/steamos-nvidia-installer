@@ -124,7 +124,7 @@ seatd libdisplay-info libinput libpipewire pipewire lcms2 libcap libx11 \
 libxcb libxcomposite libxdamage libxext libxfixes libxrender libxres \
 libxtst libxmu libxxf86vm libxkbcommon libxcursor libxi libdrm wayland \
 pixman vulkan-icd-loader xcb-util-errors xcb-util-wm \
-xorgproto libxau libxdmcp"
+xorgproto libxau libxdmcp xorg-xwayland linux-api-headers"
 GS_DEPS="$(echo $GS_DEPS)"   # collapse the line continuations' whitespace
 
 # ------------------------------------------------------------------- args
