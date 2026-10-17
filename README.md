@@ -140,11 +140,23 @@ automatically rebuilt for the new version before the reboot prompt appears
 the update is cancelled and the machine keeps booting the current working
 system — it fails safe.
 
+The hook is RAUC's post-install handler: `/etc/rauc/system.conf` points it
+at `/usr/lib/steamos-nvidia/rauc-post-install.sh`, which runs Valve's own
+handler first. Every update path — Steam's atomupd D-Bus API,
+`atomupd-manager`, `holo-update` — installs through RAUC, so none can
+bypass it (Steam no longer calls `steamos-update`, which older builds of
+this script wrapped). The new slot is kept unbootable until its driver is
+in, so even a power cut during the rebuild leaves the current OS booting.
+Progress is logged with timestamps to `/var/log/steamos-nvidia-repatch.log`.
+
 The patched gamescope (see below) is reapplied to the new OS in the same
-pass: the pinned build is reinstalled, or rebuilt from source against the
-new OS if a library changed. A gamescope failure never blocks an update —
-the new OS then runs stock gamescope (the HDR flicker returns) until
-`sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other` succeeds.
+pass. The pinned build is only reinstalled if the new OS ships the same
+gamescope version; otherwise Valve's tag for the new version is rebuilt
+with the vendored patches — it is never downgraded. If the patches don't
+apply or the build fails, the new OS runs stock gamescope (the HDR flicker
+returns) and a warning goes to the log and the journal. A gamescope
+failure never blocks an update; retry with
+`sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other`.
 
 To move to a **different driver** later, rebuild the USB image (each run
 re-resolves the driver — latest by default, or whatever `--driver` names)

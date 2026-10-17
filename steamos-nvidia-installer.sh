@@ -33,11 +33,14 @@
 #      the latter is what the installed system's regenerated grub uses).
 #   3. Makes OS updates SELF-HEALING (default): updating from within Steam
 #      works — Valve's updater stages the new OS in the spare A/B slot as
-#      usual, then a wrapper around steamos-update rebuilds the NVIDIA
+#      usual, then RAUC's post-install handler (hooked via
+#      /etc/rauc/system.conf, so it runs for every update path — Steam's
+#      atomupd D-Bus API, atomupd-manager, holo-update) rebuilds the NVIDIA
 #      driver for the new OS (in a chroot on the new slot, from that
-#      version's own repo branch) before the reboot prompt appears. If the
-#      rebuild fails, the update is cancelled and the machine keeps booting
-#      the current working system. Alternatives: --hold-updates makes Steam
+#      version's own repo branch) before the reboot prompt appears. The new
+#      slot is kept unbootable until the driver is in. If the rebuild
+#      fails, the update is cancelled and the machine keeps booting the
+#      current working system. Alternatives: --hold-updates makes Steam
 #      always report "up to date" (old behaviour), --no-hold-updates leaves
 #      stock update behaviour (an OS update then removes the driver!).
 #   4. Adds the one-click installer: Valve's own repair_device.sh (which
@@ -127,7 +130,10 @@ seatd libdisplay-info libinput libpipewire pipewire lcms2 libcap libx11 \
 libxcb libxcomposite libxdamage libxext libxfixes libxrender libxres \
 libxtst libxmu libxxf86vm libxkbcommon libxcursor libxi libdrm wayland \
 pixman vulkan-icd-loader xcb-util-errors xcb-util-wm \
-xorgproto libxau libxdmcp xorg-xwayland linux-api-headers"
+xorgproto libxau libxdmcp xorg-xwayland linux-api-headers mesa"
+# mesa: gbm.pc. The patches make gbm an OPTIONAL meson dependency, so with
+# the image's pruned mesa the build would silently come out without GBM
+# scanout — the builds below also refuse a HAVE_GBM=0 configuration.
 GS_DEPS="$(echo $GS_DEPS)"   # collapse the line continuations' whitespace
 
 # ------------------------------------------------------------------- args
@@ -555,7 +561,10 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
   # and meson then can't find x11/pipewire/hwdata. An unconditional
   # reinstall restores the dev files into the overlay (never the image:
   # already-installed packages don't enter the payload diff below).
-  in_chroot "pacman --config $PACCONF -S --noconfirm $GS_DEPS" \
+  # --overwrite: SteamOS slots carry toolchain files (gcc, make, patch,
+  # libisl, libmpc) no package owns, which pacman otherwise refuses to
+  # replace; writes land in the overlay only.
+  in_chroot "pacman --config $PACCONF -S --noconfirm --overwrite '*' $GS_DEPS" \
     || die "could not install gamescope build deps from the image's frozen mirror"
 
   # The reinstall above only covers the LISTED packages, but their .pc
@@ -564,7 +573,7 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
   # the same way. Generic fix: pacman -Qk names every registered package
   # with files missing on disk; reinstall the ones inside the deps'
   # dependency closure — exactly what was pruned, nothing unrelated.
-  in_chroot "pacman --config $PACCONF -S --noconfirm --needed pacman-contrib" \
+  in_chroot "pacman --config $PACCONF -S --noconfirm --overwrite '*' --needed pacman-contrib" \
     || die "could not install pacman-contrib (pactree) from the image's frozen mirror"
   in_chroot "for p in $GS_DEPS; do pactree -lu \"\$p\" 2>/dev/null || true; done" \
     | LC_ALL=C sort -u > "$WORKDIR/gs-closure.txt"
@@ -574,10 +583,10 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
   mapfile -t GS_FIX < <(LC_ALL=C comm -12 "$WORKDIR/gs-closure.txt" "$WORKDIR/gs-broken.txt")
   if [[ ${#GS_FIX[@]} -gt 0 ]]; then
     log "Restoring ${#GS_FIX[@]} pruned packages in the deps' closure"
-    if ! in_chroot "pacman --config $PACCONF -S --noconfirm ${GS_FIX[*]}"; then
+    if ! in_chroot "pacman --config $PACCONF -S --noconfirm --overwrite '*' ${GS_FIX[*]}"; then
       warn "bulk reinstall failed — retrying one package at a time"
       for p in "${GS_FIX[@]}"; do
-        in_chroot "pacman --config $PACCONF -S --noconfirm '$p'" \
+        in_chroot "pacman --config $PACCONF -S --noconfirm --overwrite '*' '$p'" \
           || warn "could not reinstall pruned package $p (continuing)"
       done
     fi
@@ -602,10 +611,14 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
     git -c user.name=steamos-nvidia-installer -c user.email=noreply@localhost \
       am /tmp/gs-patches/*.patch
     meson setup build --buildtype=release -Denable_tests=false
+    grep -q -- '-DHAVE_GBM=1' build/build.ninja \
+      || { echo 'gbm not found by meson (HAVE_GBM=0) — the build would lack GBM scanout' >&2; exit 1; }
     ninja -C build src/gamescope" \
     || die "gamescope build failed (check output above)"
   [[ -x "$MERGED/tmp/gamescope/build/src/gamescope" ]] \
     || die "gamescope build produced no binary"
+  grep -qaF drm_gbm_scanout "$MERGED/tmp/gamescope/build/src/gamescope" \
+    || die "built gamescope lacks the drm_gbm_scanout convar — patches not in the build?"
   GS_COMMIT="$(tr -d '[:space:]' < "$MERGED/tmp/gamescope/.commit")"
   [[ "$GS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "could not capture the built gamescope commit"
   cp "$MERGED/tmp/gamescope/build/src/gamescope" "$WORKDIR/gamescope-gbm"
@@ -932,14 +945,20 @@ CMDLINE_ADD='rd.driver.blacklist=nouveau modprobe.blacklist=nouveau nvidia-drm.m
 grep -q 'rd.driver.blacklist=nouveau' "$NEWROOT/etc/default/grub" \
   || sed -i -E "s#^(GRUB_CMDLINE_LINUX_DEFAULT=\")#\1$CMDLINE_ADD #" "$NEWROOT/etc/default/grub"
 
-# propagate the self-healing machinery (repatch.sh + driver.conf) so the
-# NEXT update is covered too
+# propagate the self-healing machinery (repatch.sh, driver.conf, the RAUC
+# handler) and hook the new slot's RAUC post-install handler, so the NEXT
+# update is covered too. Failing here cancels this update: an unhooked
+# slot would lose its driver silently on the update after.
 mkdir -p "$NEWROOT/usr/lib/steamos-nvidia"
 cp -a /usr/lib/steamos-nvidia/. "$NEWROOT/usr/lib/steamos-nvidia/"
-if [[ ! -f "$NEWROOT/usr/bin/steamos-update.orig" ]]; then
-  mv "$NEWROOT/usr/bin/steamos-update" "$NEWROOT/usr/bin/steamos-update.orig"
-  cp -a /usr/bin/steamos-update "$NEWROOT/usr/bin/steamos-update"
+SYSCONF="$NEWROOT/etc/rauc/system.conf"
+HOOK=/usr/lib/steamos-nvidia/rauc-post-install.sh
+if ! grep -qx "post-install=$HOOK" "$SYSCONF"; then
+  grep -qx 'post-install=/usr/lib/rauc/post-install.sh' "$SYSCONF" \
+    || die "unexpected post-install handler in $SYSCONF — cannot hook the next update"
+  sed -i "s|^post-install=/usr/lib/rauc/post-install.sh\$|post-install=$HOOK|" "$SYSCONF"
 fi
+log "RAUC post-install hook set in $PARTSET"
 [[ -f "$NEWROOT/usr/lib/systemd/system/steamos-finish-oobe-migration.service" ]] \
   && ln -sf /dev/null "$NEWROOT/etc/systemd/system/steamos-finish-oobe-migration.service"
 [[ -f /etc/sudoers.d/zz-deck-nopasswd ]] \
@@ -964,78 +983,106 @@ log "OK — $PARTSET is NVIDIA-ready ($KVER)"
 REPATCH
   chmod 755 "$MNT/usr/lib/steamos-nvidia/repatch.sh"
 
-  # ---- wrapper around steamos-update: real update, then repatch the new slot
-  if [[ ! -f "$MNT/usr/bin/steamos-update.orig" ]]; then
-    mv "$MNT/usr/bin/steamos-update" "$MNT/usr/bin/steamos-update.orig"
+  # ---- RAUC post-install hook: every OS update repatches the new slot.
+  # Steam no longer runs steamos-update (deprecated upstream — the client
+  # talks to atomupd-daemon over D-Bus; the 20261013 update bypassed the old
+  # wrapper entirely). Every install path ends in RAUC, whose post-install
+  # handler is named in /etc/rauc/system.conf — point it at ours, which
+  # runs Valve's handler first. repatch.sh re-applies the hook to each new
+  # slot. A wrapper left by an older build of this script is undone.
+  if [[ -f "$MNT/usr/bin/steamos-update.orig" ]]; then
+    mv -f "$MNT/usr/bin/steamos-update.orig" "$MNT/usr/bin/steamos-update"
   fi
-  cat > "$MNT/usr/bin/steamos-update" <<'WRAP'
+  cat > "$MNT/usr/lib/steamos-nvidia/rauc-post-install.sh" <<'HOOK'
 #!/bin/bash
-# steamos-update wrapper (steamos-nvidia self-healing updates).
-# Runs Valve's real updater, then rebuilds the NVIDIA driver inside the
-# freshly staged OS slot. If that fails, the update is cancelled: the
-# bootloader keeps booting the current (working) image.
-REAL=/usr/bin/steamos-update.orig
-REPATCH=/usr/lib/steamos-nvidia/repatch.sh
+# RAUC post-install handler (steamos-nvidia self-healing updates).
+# /etc/rauc/system.conf names this instead of Valve's handler. Every OS
+# update — Steam's atomupd D-Bus API, atomupd-manager, holo-update — installs
+# through RAUC, so this runs for all of them, and Steam only offers the
+# reboot once it returns.
+#
+#   1. Run Valve's own post-install (configures the new slot's efi and var,
+#      arms it for first boot).
+#   2. Disarm the new slot at once: without an NVIDIA driver it boots to a
+#      black screen, so it must stay unbootable even if this handler is
+#      killed or power is lost during the 10-20 min rebuild.
+#   3. Rebuild the driver into it. On success reapply the patched gamescope
+#      (non-fatal) and re-arm the slot exactly as Valve's handler did. On
+#      failure report the install as failed; the current OS keeps booting.
+set -u
+VALVE=/usr/lib/rauc/post-install.sh
+DIR=/usr/lib/steamos-nvidia
 LOG=/var/log/steamos-nvidia-repatch.log
+REBOOT_FOR_UPDATE=/run/steamos-atomupd/reboot_for_update
+SYNC_TRIGGER=/run/steamos-atomupd/holo-booted-slot-sync-trigger
 
-is_apply=1
-for a in "$@"; do
-  case "$a" in check|--supports-duplicate-detection) is_apply=0 ;; esac
-done
-
-"$REAL" "$@"
-rc=$?
-
-# Edit the boot config of every slot EXCEPT the currently booted one.
-# The conf files on the ESP are plain text; editing them directly is the
-# only revert that reliably steers steamcl (set-mode booted does NOT undo a
-# staged switch, and a zeroed boot-requested-at still gets retried while
-# boot-attempts is nonzero — both verified the hard way).
-edit_other_confs() {  # args: sed expressions
-  local this conf
-  this="$(steamos-bootconf this-image 2>/dev/null)" || return 0
-  [[ -n "$this" ]] || return 0
-  for conf in /esp/SteamOS/conf/*.conf; do
-    [[ -f "$conf" ]] || continue
-    [[ "$(basename "$conf" .conf)" == "$this" ]] && continue
-    sed -i "$@" "$conf"
-  done
-  sync -f /esp/SteamOS/conf 2>/dev/null || sync
+say() {
+  echo "[steamos-nvidia] $*" >&2
+  echo "$(date '+%F %T') [post-install] $*" >> "$LOG"
 }
 
-if [[ $rc -eq 0 && $is_apply -eq 1 ]]; then
-  echo "Update staged. Building NVIDIA driver for the new OS (10-20 min, do NOT power off)..." >&2
-  if "$REPATCH" other >> "$LOG" 2>&1; then
-    echo "NVIDIA driver installed into the updated OS. Safe to reboot." >&2
-    # Reapply the GBM-scanout gamescope. NON-fatal by design: stock
-    # gamescope boots fine (it just flickers at high HDR modes), so this
-    # must never cancel an OS update. Absent when built --no-gamescope.
-    if [[ -x /usr/lib/steamos-nvidia/gamescope-repatch.sh ]]; then
-      echo "Reapplying patched gamescope to the new OS..." >&2
-      if ! /usr/lib/steamos-nvidia/gamescope-repatch.sh other >> "$LOG" 2>&1; then
-        echo "!! gamescope repatch failed — the updated OS will run STOCK gamescope" >&2
-        echo "!! (high-res HDR flicker returns). Details: $LOG" >&2
-        echo "!! Retry: sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other" >&2
-      fi
-    fi
-    # make sure the freshly patched slot is bootable (clears an
-    # image-invalid left by a previously cancelled update)
-    edit_other_confs -e 's/^image-invalid:.*/image-invalid: 0/'
+say "OS update written to the spare slot — running Valve's post-install"
+"$VALVE" "$@"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  say "Valve's post-install failed (rc=$rc) — the update fails as it would on stock"
+  exit "$rc"
+fi
+
+THIS="$(holo-bootconf this-image)"
+case "$THIS" in
+  A) OTHER=B ;;
+  B) OTHER=A ;;
+  *) say "booted slot '$THIS' is neither A nor B"; exit 1 ;;
+esac
+CONF=/esp/SteamOS/conf/$OTHER.conf
+[[ -f "$CONF" ]] || { say "boot config $CONF missing"; exit 1; }
+
+# Editing the conf is what reliably steers the chainloader; set-mode booted
+# alone does NOT undo a staged switch (verified on hardware with the old
+# steamos-update wrapper's cancel path, which this mirrors).
+sed -i -e 's/^boot-requested-at:.*/boot-requested-at: 0/' \
+       -e 's/^boot-attempts:.*/boot-attempts: 0/' \
+       -e 's/^image-invalid:.*/image-invalid: 1/' "$CONF"
+holo-bootconf set-mode booted
+sync -f "$CONF" 2>/dev/null || sync
+say "slot $OTHER disarmed until its NVIDIA driver is in place (next boot: $(holo-bootconf selected-image))"
+
+say "building the NVIDIA driver into slot $OTHER (10-20 min)"
+if ! "$DIR/repatch.sh" other >> "$LOG" 2>&1; then
+  say "!! NVIDIA driver rebuild for slot $OTHER FAILED — update cancelled, slot $THIS keeps booting. Details: $LOG"
+  rm -f "$REBOOT_FOR_UPDATE" "$SYNC_TRIGGER"
+  exit 1
+fi
+say "NVIDIA driver installed into slot $OTHER"
+
+if [[ -x "$DIR/gamescope-repatch.sh" ]]; then
+  if "$DIR/gamescope-repatch.sh" other >> "$LOG" 2>&1; then
+    say "patched gamescope applied to slot $OTHER"
   else
-    echo "!! NVIDIA driver rebuild FAILED — cancelling this update." >&2
-    echo "!! The system will keep booting the current working version." >&2
-    echo "!! Details: $LOG" >&2
-    edit_other_confs \
-      -e 's/^boot-requested-at:.*/boot-requested-at: 0/' \
-      -e 's/^boot-attempts:.*/boot-attempts: 0/' \
-      -e 's/^image-invalid:.*/image-invalid: 1/'
-    steamos-bootconf set-mode booted 2>/dev/null
-    exit 1
+    say "!! gamescope repatch failed — slot $OTHER will run STOCK gamescope (high-res HDR flicker returns). Details: $LOG"
   fi
 fi
-exit $rc
-WRAP
-  chmod 755 "$MNT/usr/bin/steamos-update"
+
+# re-arm: the same call Valve's handler made before we disarmed the slot
+sed -i -e 's/^image-invalid:.*/image-invalid: 0/' "$CONF"
+holo-bootconf --image "$OTHER" set-mode first-boot
+sync -f "$CONF" 2>/dev/null || sync
+SELECTED="$(holo-bootconf selected-image)"
+say "slot $OTHER re-armed for first boot (next boot: $SELECTED)"
+[[ "$SELECTED" == "$OTHER" ]] \
+  || say "!! slot $OTHER is ready but $SELECTED is still selected — the update will not apply on reboot"
+exit 0
+HOOK
+  chmod 755 "$MNT/usr/lib/steamos-nvidia/rauc-post-install.sh"
+
+  SYSCONF="$MNT/etc/rauc/system.conf"
+  RAUC_HOOK=/usr/lib/steamos-nvidia/rauc-post-install.sh
+  if ! grep -qx "post-install=$RAUC_HOOK" "$SYSCONF"; then
+    grep -qx 'post-install=/usr/lib/rauc/post-install.sh' "$SYSCONF" \
+      || die "unexpected post-install handler in $SYSCONF — cannot hook OS updates"
+    sed -i "s|^post-install=/usr/lib/rauc/post-install.sh\$|post-install=$RAUC_HOOK|" "$SYSCONF"
+  fi
 
   # ---- gamescope self-heal: pinned record + prebuilt binary + repatch tool.
   # Everything lives in /usr/lib/steamos-nvidia, which repatch.sh already
@@ -1069,12 +1116,16 @@ EOF
 #
 # Strategy, same route as the driver self-heal:
 #   1. If the slot already carries our binary → just re-assert the env flag.
-#   2. Install the prebuilt binary (pinned at image build time) and verify it
-#      links against the new slot's libraries (chroot ldd).
-#   3. If the new OS bumped a library soname and the prebuilt binary no longer
-#      links, rebuild the SAME pinned tag + vendored patches from source in
-#      an overlay chroot on the new slot, against that slot's own frozen
-#      mirror.
+#   2. Never downgrade: the prebuilt binary is only installed when the new
+#      slot's stock gamescope is the same version as the pin (GS_TAG). It is
+#      then verified to link against the slot's libraries (chroot ldd).
+#   3. Otherwise — a different stock version, or the prebuilt no longer
+#      links — rebuild Valve's tag for the slot's stock version with the
+#      vendored patches, in an overlay chroot on the new slot against its
+#      own frozen mirror. If the patches don't apply or the build fails,
+#      the slot keeps STOCK gamescope and this says so loudly.
+#   The binary and pin that end up in the slot are recorded in ITS copy of
+#   /usr/lib/steamos-nvidia, which is what the next update starts from.
 #
 # Unlike the driver repatch this must NEVER cancel an update: stock gamescope
 # boots fine, it just flickers at >1440p120 HDR. Callers treat rc!=0 as a
@@ -1085,6 +1136,11 @@ PARTSET="${1:-other}"
 DIR=/usr/lib/steamos-nvidia
 log()  { echo "[gs-repatch] $*"; }
 fail() { echo "[gs-repatch] FAIL: $*" >&2; exit 1; }
+# shout — for outcomes the user must notice: also to the journal
+shout() {
+  echo "[gs-repatch] !! $*" >&2
+  logger -t steamos-nvidia -p user.warning "gamescope repatch: $*" 2>/dev/null || true
+}
 
 # shellcheck disable=SC1091
 source "$DIR/gamescope.conf"
@@ -1147,6 +1203,13 @@ if cmp -s "$BIN" "$NEWROOT/usr/bin/gamescope"; then
   exit 0
 fi
 
+# Stock gamescope version in the slot (upstream part: no epoch, no pkgrel)
+STOCK_PKG="$(pacman --root "$NEWROOT" --dbpath "$NEWROOT/usr/lib/holo/pacmandb" \
+  -Q gamescope 2>/dev/null | awk '{print $2}')" || true
+STOCK_TAG="${STOCK_PKG#*:}"; STOCK_TAG="${STOCK_TAG%-*}"
+[[ -n "$STOCK_TAG" ]] || { shout "cannot read the stock gamescope version in $PARTSET — leaving STOCK gamescope"; exit 1; }
+log "Stock gamescope in $PARTSET: $STOCK_PKG; pinned build: $GS_TAG"
+
 # try_install <binary> — put it in place and verify it resolves against the
 # slot's own libraries. Restores stock on link failure.
 try_install() {
@@ -1164,14 +1227,22 @@ try_install() {
   return 0
 }
 
-if try_install "$BIN"; then
-  log "OK — prebuilt patched gamescope ($GS_COMMIT) installed into $PARTSET"
-  exit 0
+BUILD_TAG="$GS_TAG"
+BUILD_COMMIT="$GS_COMMIT"
+if [[ "$STOCK_TAG" == "$GS_TAG" ]]; then
+  if try_install "$BIN"; then
+    log "OK — prebuilt patched gamescope $GS_TAG ($GS_COMMIT) installed into $PARTSET"
+    exit 0
+  fi
+  log "Prebuilt binary incompatible with the new OS — rebuilding $GS_TAG from source (takes a while)"
+else
+  shout "stock gamescope in $PARTSET is $STOCK_TAG, the pinned patched build is $GS_TAG — NOT installing it (never replace a different gamescope version)"
+  shout "rebuilding Valve's $STOCK_TAG with the $GS_TAG patches; if they don't apply or build, $PARTSET keeps STOCK gamescope"
+  BUILD_TAG="$STOCK_TAG"
+  BUILD_COMMIT=""   # no pin for a tag the patches were never built against
 fi
 
 # ------------------------------------------------------- rebuild from source
-log "Prebuilt binary incompatible with the new OS — rebuilding pinned commit from source (takes a while)"
-
 # Overlay build chroot on the new slot. /home is casefolded ext4, which
 # overlayfs rejects as upperdir — so the workspace lives in a plain ext4
 # loopback image on /home (same trick as the driver repatch).
@@ -1190,30 +1261,34 @@ mount --rbind /sys "$MERGED/sys"; mount --make-rslave "$MERGED/sys"
 mount --rbind /dev "$MERGED/dev"; mount --make-rslave "$MERGED/dev"
 rm -f "$MERGED/etc/resolv.conf"; cp -L /etc/resolv.conf "$MERGED/etc/resolv.conf"
 in_chroot() { chroot "$MERGED" /bin/bash -c "$*"; }
+# Any failure from here on leaves the slot on stock gamescope.
+stock_fail() { shout "$* — $PARTSET keeps STOCK gamescope"; exit 1; }
 
 [[ -d "$MERGED/etc/pacman.d/gnupg/private-keys-v1.d" ]] \
   || in_chroot "pacman-key --init && pacman-key --populate" || true
 
 log "Installing build deps from the slot's own frozen mirror"
-in_chroot "pacman -Sy" || fail "pacman -Sy failed in build chroot"
+in_chroot "pacman -Sy" || stock_fail "pacman -Sy failed in build chroot"
 # NO --needed: the OS ships many of these registered in the pacman db but
 # with dev files (headers, .pc) pruned — reinstall restores them (overlay
 # only; the slot's rootfs is never touched by the build chroot).
-if ! in_chroot "pacman -S --noconfirm $GS_DEPS"; then
+# --overwrite: the slot carries toolchain files (gcc, make, patch, libisl,
+# libmpc) no package owns, which pacman otherwise refuses to replace.
+if ! in_chroot "pacman -S --noconfirm --overwrite '*' $GS_DEPS"; then
   # unattended context: keyring drift must not kill the repatch — packages
   # come over HTTPS from Valve's own mirror
   log "WARNING: dep install failed (keyring?) — retrying with signature checks off"
   sed 's/^SigLevel.*/SigLevel = Never/' "$MERGED/etc/pacman.conf" > "$MERGED/tmp/pacman-nosig.conf"
-  in_chroot "pacman --config /tmp/pacman-nosig.conf -S --noconfirm $GS_DEPS" \
-    || fail "build dependency install failed"
+  in_chroot "pacman --config /tmp/pacman-nosig.conf -S --noconfirm --overwrite '*' $GS_DEPS" \
+    || stock_fail "build dependency install failed"
 fi
 
 # Restore the rest of the pruned dep closure (the OS strips dev files —
 # headers, .pc — from registered packages; the .pc Requires chains reach
 # beyond the listed deps). pacman -Qk names packages with missing files;
 # reinstall the ones inside the deps' dependency closure.
-in_chroot "pacman -S --noconfirm --needed pacman-contrib" \
-  || fail "could not install pacman-contrib (pactree)"
+in_chroot "pacman -S --noconfirm --overwrite '*' --needed pacman-contrib" \
+  || stock_fail "could not install pacman-contrib (pactree)"
 in_chroot "for p in $GS_DEPS; do pactree -lu \"\$p\" 2>/dev/null || true; done" \
   | LC_ALL=C sort -u > "$WORK/gs-closure.txt"
 in_chroot "pacman -Qk 2>/dev/null || true" \
@@ -1222,48 +1297,71 @@ in_chroot "pacman -Qk 2>/dev/null || true" \
 mapfile -t GS_FIX < <(LC_ALL=C comm -12 "$WORK/gs-closure.txt" "$WORK/gs-broken.txt")
 if [[ ${#GS_FIX[@]} -gt 0 ]]; then
   log "Restoring ${#GS_FIX[@]} pruned packages in the deps' closure"
-  if ! in_chroot "pacman -S --noconfirm ${GS_FIX[*]}"; then
+  if ! in_chroot "pacman -S --noconfirm --overwrite '*' ${GS_FIX[*]}"; then
     log "WARNING: bulk reinstall failed — retrying one package at a time"
     for p in "${GS_FIX[@]}"; do
-      in_chroot "pacman -S --noconfirm '$p'" \
+      in_chroot "pacman -S --noconfirm --overwrite '*' '$p'" \
         || log "WARNING: could not reinstall pruned package $p (continuing)"
     done
   fi
 fi
 
-compgen -G "$PATCHES/*.patch" >/dev/null || fail "no vendored patches in $PATCHES"
-log "Fetching gamescope $GS_TAG ($GS_COMMIT) and applying vendored patches"
+compgen -G "$PATCHES/*.patch" >/dev/null || stock_fail "no vendored patches in $PATCHES"
+log "Fetching gamescope $BUILD_TAG from $GS_REPO"
 rm -rf "$MERGED/opt/gsbuild"
 mkdir -p "$MERGED/opt/gsbuild/patches"
 cp "$PATCHES"/*.patch "$MERGED/opt/gsbuild/patches/"
 in_chroot "set -e
   cd /opt/gsbuild
-  git clone -q --depth=1 -b '$GS_TAG' '$GS_REPO' gamescope && cd gamescope
-  # a moved tag would no longer be what the patches were tested against
-  [ \"\$(git rev-parse HEAD)\" = '$GS_COMMIT' ]
+  git clone -q --depth=1 -b '$BUILD_TAG' '$GS_REPO' gamescope
+  git -C gamescope rev-parse HEAD > /opt/gsbuild/commit
+" || stock_fail "could not fetch Valve's gamescope tag $BUILD_TAG"
+BUILT_COMMIT="$(tr -d '[:space:]' < "$MERGED/opt/gsbuild/commit")"
+# a moved tag would no longer be what the patches were tested against
+[[ -z "$BUILD_COMMIT" || "$BUILT_COMMIT" == "$BUILD_COMMIT" ]] \
+  || stock_fail "tag $BUILD_TAG now points at $BUILT_COMMIT, not the pinned $BUILD_COMMIT"
+
+log "Applying vendored patches to $BUILD_TAG ($BUILT_COMMIT)"
+in_chroot "set -e; cd /opt/gsbuild/gamescope
   git submodule update --init --recursive --depth=1 || git submodule update --init --recursive
   git -c user.name=steamos-nvidia-installer -c user.email=noreply@localhost \
     am /opt/gsbuild/patches/*.patch
-" || fail "source fetch or patch apply failed"
+" || stock_fail "the $GS_TAG patches do not apply to gamescope $BUILD_TAG (vendor patches/gamescope/$BUILD_TAG in the installer)"
 
 log "Building gamescope"
-in_chroot "cd /opt/gsbuild/gamescope && meson setup build --buildtype=release -Denable_tests=false && ninja -C build src/gamescope" \
-  || fail "gamescope build failed (see log above)"
+in_chroot "set -e; cd /opt/gsbuild/gamescope
+  meson setup build --buildtype=release -Denable_tests=false
+  grep -q -- '-DHAVE_GBM=1' build/build.ninja \
+    || { echo 'gbm not found by meson (HAVE_GBM=0) — the build would lack GBM scanout' >&2; exit 1; }
+  ninja -C build src/gamescope" \
+  || stock_fail "gamescope $BUILD_TAG build failed (see log above)"
 
 REBUILT="$MERGED/opt/gsbuild/gamescope/build/src/gamescope"
-[[ -x "$REBUILT" ]] || fail "build produced no binary"
+[[ -x "$REBUILT" ]] || stock_fail "build produced no binary"
+grep -qaF drm_gbm_scanout "$REBUILT" || stock_fail "rebuilt binary lacks the drm_gbm_scanout convar"
 cp "$REBUILT" "$NEWROOT/tmp/gamescope-rebuilt.$$"
 
 if try_install "$NEWROOT/tmp/gamescope-rebuilt.$$"; then
   rm -f "$NEWROOT/tmp/gamescope-rebuilt.$$"
-  # future updates reuse the rebuilt binary directly instead of rebuilding
-  cp "$NEWROOT/usr/bin/gamescope" "$DIR/gamescope-gbm.bin.new" \
-    && mv "$DIR/gamescope-gbm.bin.new" "$DIR/gamescope-gbm.bin" || true
-  log "OK — rebuilt patched gamescope installed into $PARTSET (prebuilt cache refreshed)"
+  # Record the result in the NEW slot's machinery (the driver repatch has
+  # already copied ours there): the next update runs from that slot and
+  # must reuse THIS binary and pin. The running slot's copy stays matched
+  # to the running OS, in case the update is rolled back.
+  NEWDIR="$NEWROOT$DIR"
+  mkdir -p "$NEWDIR"
+  [[ -f "$NEWDIR/gamescope.conf" ]] || cp -a "$DIR/gamescope.conf" "$NEWDIR/gamescope.conf"
+  [[ -d "$NEWDIR/gamescope-patches" ]] || cp -a "$PATCHES" "$NEWDIR/gamescope-patches"
+  install -m644 "$NEWROOT/usr/bin/gamescope" "$NEWDIR/gamescope-gbm.bin"
+  sed -i -e "s|^GS_TAG=.*|GS_TAG=\"$BUILD_TAG\"|" \
+         -e "s|^GS_COMMIT=.*|GS_COMMIT=\"$BUILT_COMMIT\"|" "$NEWDIR/gamescope.conf"
+  if [[ "$BUILD_TAG" != "$GS_TAG" ]]; then
+    shout "installed gamescope $BUILD_TAG + the $GS_TAG patches into $PARTSET — a port the patches were not tested on; vendor patches/gamescope/$BUILD_TAG once verified"
+  fi
+  log "OK — rebuilt patched gamescope $BUILD_TAG ($BUILT_COMMIT) installed into $PARTSET (pin + prebuilt recorded there)"
   exit 0
 fi
 rm -f "$NEWROOT/tmp/gamescope-rebuilt.$$"
-fail "rebuilt binary still does not link — stock gamescope left in place"
+stock_fail "rebuilt binary does not link"
 GSREPATCH
     chmod 755 "$MNT/usr/lib/steamos-nvidia/gamescope-repatch.sh"
   fi
@@ -1438,8 +1536,10 @@ log "Sanity checks"
 compgen -G "$MNT/usr/lib/modules/$KVER/updates/dkms/nvidia.ko*" >/dev/null || die "nvidia.ko missing from image"
 grep -q 'blacklist nouveau' "$MNT/etc/modprobe.d/99-nvidia-patch.conf" || die "modprobe conf is empty/missing"
 if [[ $UPDATE_MODE == selfheal ]]; then
-  grep -q 'self-healing' "$MNT/usr/bin/steamos-update" || die "update wrapper missing"
-  [[ -f "$MNT/usr/bin/steamos-update.orig" ]] || die "original steamos-update not preserved"
+  grep -qx 'post-install=/usr/lib/steamos-nvidia/rauc-post-install.sh' "$MNT/etc/rauc/system.conf" \
+    || die "RAUC post-install hook not set in /etc/rauc/system.conf"
+  [[ -x "$MNT/usr/lib/steamos-nvidia/rauc-post-install.sh" ]] || die "RAUC post-install handler missing"
+  [[ -f "$MNT/usr/bin/steamos-update.orig" ]] && die "stale steamos-update wrapper left in the image"
   grep -q 'repatch' "$MNT/usr/lib/steamos-nvidia/repatch.sh" || die "repatch tool missing"
   grep -q "^DRIVER_VERSION=\"$DRIVER_VERSION\"" "$MNT/usr/lib/steamos-nvidia/driver.conf" || die "driver.conf missing/wrong"
   [[ -L "$MNT/etc/systemd/system/atomupd.service" ]] && die "atomupd must NOT be masked in selfheal mode"
@@ -1452,7 +1552,8 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
     [[ -x "$MNT/usr/lib/steamos-nvidia/gamescope-repatch.sh" ]] || die "gamescope-repatch.sh missing"
     cmp -s "$WORKDIR/gamescope-gbm" "$MNT/usr/lib/steamos-nvidia/gamescope-gbm.bin" || die "self-heal gamescope binary differs"
     grep -q "^GS_COMMIT=\"$GS_COMMIT\"" "$MNT/usr/lib/steamos-nvidia/gamescope.conf" || die "gamescope.conf commit pin wrong"
-    grep -q 'gamescope-repatch' "$MNT/usr/bin/steamos-update" || die "update wrapper missing the gamescope hook"
+    grep -q 'gamescope-repatch' "$MNT/usr/lib/steamos-nvidia/rauc-post-install.sh" || die "RAUC handler missing the gamescope hook"
+    compgen -G "$MNT/usr/lib/steamos-nvidia/gamescope-patches/*.patch" >/dev/null || die "gamescope patches not shipped"
   fi
 fi
 compgen -G "$MNT/usr/lib/firmware/nvidia/*/gsp_*.bin" >/dev/null || warn "GSP firmware not found — nvidia-open needs it"
@@ -1488,10 +1589,12 @@ $( case $UPDATE_MODE in
            pinned driver is rebuilt for each new OS version automatically
            (adds 10-20 min per update; failed rebuilds cancel the update,
            system stays working).$( [[ $PATCH_GAMESCOPE -eq 1 ]] && echo "
-           The patched gamescope is reapplied on every update too — and
-           rebuilt against the new OS if its libraries changed; a gamescope
-           failure never blocks an update (the slot then runs stock
-           gamescope until: sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other)." )
+           The patched gamescope is reapplied on every update too — the
+           pinned build only if the new OS ships the same gamescope version,
+           otherwise Valve's matching tag is rebuilt with the patches (never
+           a downgrade); a gamescope failure never blocks an update (the
+           slot then runs stock gamescope until:
+           sudo /usr/lib/steamos-nvidia/gamescope-repatch.sh other)." )
            For a NEWER driver later: rerun this
            script and reinstall from the fresh USB image." ;;
      hold)     echo "  Updates: OS updates HELD (atomupd + OOBE migration masked, CLIs stubbed)." ;;
