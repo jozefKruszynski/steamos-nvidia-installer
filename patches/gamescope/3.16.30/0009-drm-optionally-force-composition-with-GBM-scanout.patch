@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: steamos-nvidia-installer <noreply@example.com>
+Date: Sat, 17 Oct 2026 10:05:57 +0200
+Subject: [PATCH 9/9] drm: optionally force composition with GBM scanout
+
+Add drm_gbm_force_composite (off by default). When GBM scanout buffers
+are active, always composite so client DMA-BUFs are never scanned out
+directly. Ported from antheas/gamescope@fa6f7f2, which does this
+unconditionally on nvidia-drm.
+---
+ src/Backends/DRMBackend.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+index a23b44e..921aa83 100644
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -92,6 +92,8 @@ gamescope::ConVar<bool> cv_drm_gbm_scanout( "drm_gbm_scanout", false, "Allocate
+ 		g_bForceOutputImageRemake = true;
+ 	});
+ 
++gamescope::ConVar<bool> cv_drm_gbm_force_composite( "drm_gbm_force_composite", false, "When GBM scanout buffers are in use, always composite so client buffers are never scanned out directly. Works around NVIDIA client DMA-BUFs lacking a physical-contiguity guarantee." );
++
+ gamescope::ConVar<bool> cv_drm_allow_dynamic_modes_for_external_display( "drm_allow_dynamic_modes_for_external_display", false, "Allow dynamic mode/refresh rate switching for external displays." );
+ 
+ int HackyDRMPresent( const FrameInfo_t *pFrameInfo, bool bAsync );
+@@ -4015,6 +4017,9 @@ namespace gamescope
+ 
+ 			bool bNeedsFullComposite = false;
+ 			bNeedsFullComposite |= cv_composite_force;
++			// NVIDIA client DMA-BUFs have no physical-contiguity guarantee; when
++			// requested, never scan them out directly.
++			bNeedsFullComposite |= cv_drm_gbm_force_composite && SupportsExternalScanoutBuffers();
+ 			bNeedsFullComposite |= bWasFirstFrame;
+ 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
+ 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;

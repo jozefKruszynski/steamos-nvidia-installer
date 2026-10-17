@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 20 Aug 2026 07:52:59 +0000
+Subject: [PATCH 5/9] gitignore: ignore meson-extracted glm subproject
+ directory
+
+The glm wrap now extracts to subprojects/glm, which the existing glm-*
+pattern does not match.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014ZqFjz2VRJrkstciYqbXbg
+(cherry picked from commit 977e4f56dc12c6ba3da6a04936a16a741cf403bf)
+---
+ subprojects/.gitignore | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/subprojects/.gitignore b/subprojects/.gitignore
+index aa23451..f1af717 100644
+--- a/subprojects/.gitignore
++++ b/subprojects/.gitignore
+@@ -1,3 +1,4 @@
+ glm-*
++glm
+ packagecache
+ stb
