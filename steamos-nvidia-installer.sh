@@ -83,14 +83,15 @@
 #                      buffers through Vulkan, which lands them on scattered
 #                      vidmem pages — the severe flicker/corruption above
 #                      2560x1440@120 with HDR (NVIDIA forum thread 295314).
-#                      By default this script builds NightHammer1000's
-#                      poc/gamescope-gbm-route gamescope (GBM scanout
+#                      By default this script builds Valve's gamescope at
+#                      GS_TAG with the vendored patch series in
+#                      patches/gamescope/<tag>/ applied (GBM scanout
 #                      allocations, gated behind gamescope_drm_gbm_scanout=1),
 #                      installs it over the stock binary (kept as
 #                      gamescope.stock) and, in selfheal mode, reapplies it
 #                      on every OS update — reinstalling the pinned build,
-#                      or rebuilding the same commit against the new OS if
-#                      a library soname changed.
+#                      or rebuilding the same tag + patches against the new
+#                      OS if a library soname changed.
 #
 # Host needs: Arch-ish Linux, losetup, btrfs-progs, rsync, curl, kmod, zstd,
 # python3, readelf (binutils).
@@ -107,12 +108,14 @@ log()  { printf '\e[1;35m[nvidia-usb]\e[0m %s\n' "$*"; }
 warn() { printf '\e[1;33m[warn]\e[0m %s\n' "$*" >&2; }
 die()  { printf '\e[1;31m[fail]\e[0m %s\n' "$*" >&2; exit 1; }
 
-# ------------------------------------------ gamescope GBM-scanout fork
-# See --no-gamescope in the header. Env-overridable for testing a different
-# fork/branch; the commit actually built is pinned into the image for the
-# self-heal rebuild path.
-GS_REPO="${GS_REPO:-https://github.com/NightHammer1000/gamescope.git}"
-GS_BRANCH="${GS_BRANCH:-poc/gamescope-gbm-route}"
+# ------------------------------------------ gamescope GBM-scanout patches
+# See --no-gamescope in the header. Upstream Valve gamescope at GS_TAG plus
+# the patch series vendored in patches/gamescope/<GS_TAG>/ (git am order).
+# Env-overridable for testing another tag; the tag's commit is pinned into
+# the image, and the patches shipped with it, for the self-heal rebuild path.
+GS_REPO="${GS_REPO:-https://github.com/ValveSoftware/gamescope.git}"
+GS_TAG="${GS_TAG:-3.16.30}"
+GS_PATCHES="$SCRIPT_DIR/patches/gamescope/$GS_TAG"
 GS_ENV_FLAG='gamescope_drm_gbm_scanout=1'
 # Build deps, resolvable from the image's own frozen mirror (no current-Arch
 # libraries enter the image — the build stays in the overlay). Also recorded
@@ -542,6 +545,8 @@ touch "$GS_TOOLCHAIN"
 GS_COMMIT=""
 if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
   [[ -x "$MNT/usr/bin/gamescope" ]] || die "no /usr/bin/gamescope in the image — cannot apply the GBM-scanout patch"
+  compgen -G "$GS_PATCHES/*.patch" >/dev/null \
+    || die "no gamescope patches for $GS_TAG in $GS_PATCHES"
   log "Installing gamescope build toolchain into the overlay (image's frozen mirror)"
   in_chroot "pacman -Qq" | LC_ALL=C sort > "$WORKDIR/gs-pre.txt"
   # NO --needed here: many of these are runtime packages the image already
@@ -583,14 +588,19 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
     | cat - "$GS_TOOLCHAIN" | LC_ALL=C sort -u > "$GS_TOOLCHAIN.tmp"
   mv "$GS_TOOLCHAIN.tmp" "$GS_TOOLCHAIN"
 
-  log "Building gamescope GBM-scanout fork ($GS_BRANCH — a few minutes)"
+  log "Building gamescope $GS_TAG + GBM-scanout patches (a few minutes)"
+  rm -rf "$MERGED/tmp/gs-patches"
+  mkdir -p "$MERGED/tmp/gs-patches"
+  cp "$GS_PATCHES"/*.patch "$MERGED/tmp/gs-patches/"
   in_chroot "set -e
     rm -rf /tmp/gamescope
     cd /tmp
     git clone --depth=1 --recurse-submodules --shallow-submodules \
-      -b '$GS_BRANCH' '$GS_REPO' gamescope
+      -b '$GS_TAG' '$GS_REPO' gamescope
     cd gamescope
     git rev-parse HEAD > .commit
+    git -c user.name=steamos-nvidia-installer -c user.email=noreply@localhost \
+      am /tmp/gs-patches/*.patch
     meson setup build --buildtype=release -Denable_tests=false
     ninja -C build src/gamescope" \
     || die "gamescope build failed (check output above)"
@@ -599,7 +609,7 @@ if [[ $PATCH_GAMESCOPE -eq 1 ]]; then
   GS_COMMIT="$(tr -d '[:space:]' < "$MERGED/tmp/gamescope/.commit")"
   [[ "$GS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "could not capture the built gamescope commit"
   cp "$MERGED/tmp/gamescope/build/src/gamescope" "$WORKDIR/gamescope-gbm"
-  log "Built gamescope $GS_BRANCH @ $GS_COMMIT"
+  log "Built gamescope $GS_TAG ($GS_COMMIT) + $(ls "$GS_PATCHES"/*.patch | wc -l) patches"
 fi
 
 # "Before" = the pristine image's own pacman db (read directly, host-side) —
@@ -1036,29 +1046,35 @@ WRAP
     cat > "$MNT/usr/lib/steamos-nvidia/gamescope.conf" <<EOF
 # Written by steamos-nvidia-installer at image build time.
 # gamescope-repatch.sh reinstalls the prebuilt binary on every OS update and
-# rebuilds this exact commit from source if the new OS breaks its linkage.
+# rebuilds this exact tag + gamescope-patches/ from source if the new OS
+# breaks its linkage.
 GS_REPO="$GS_REPO"
-GS_BRANCH="$GS_BRANCH"
+GS_TAG="$GS_TAG"
 GS_COMMIT="$GS_COMMIT"
 GS_ENV_FLAG="$GS_ENV_FLAG"
 GS_DEPS="$GS_DEPS"
 EOF
     chmod 644 "$MNT/usr/lib/steamos-nvidia/gamescope.conf"
     install -m644 "$WORKDIR/gamescope-gbm" "$MNT/usr/lib/steamos-nvidia/gamescope-gbm.bin"
+    rm -rf "$MNT/usr/lib/steamos-nvidia/gamescope-patches"
+    install -d -m755 "$MNT/usr/lib/steamos-nvidia/gamescope-patches"
+    install -m644 "$GS_PATCHES"/*.patch "$MNT/usr/lib/steamos-nvidia/gamescope-patches/"
 
     cat > "$MNT/usr/lib/steamos-nvidia/gamescope-repatch.sh" <<'GSREPATCH'
 #!/bin/bash
-# steamos-nvidia gamescope repatch — reapply the NightHammer GBM-scanout
-# gamescope build to another partition set (normally "other", right after an
-# OS update staged there). Modeled on repatch.sh (the driver repatch).
+# steamos-nvidia gamescope repatch — reapply the GBM-scanout gamescope build
+# (Valve's GS_TAG + gamescope-patches/) to another partition set (normally
+# "other", right after an OS update staged there). Modeled on repatch.sh
+# (the driver repatch).
 #
 # Strategy, same route as the driver self-heal:
 #   1. If the slot already carries our binary → just re-assert the env flag.
 #   2. Install the prebuilt binary (pinned at image build time) and verify it
 #      links against the new slot's libraries (chroot ldd).
 #   3. If the new OS bumped a library soname and the prebuilt binary no longer
-#      links, rebuild the SAME pinned commit from source in an overlay chroot
-#      on the new slot, against that slot's own frozen mirror.
+#      links, rebuild the SAME pinned tag + vendored patches from source in
+#      an overlay chroot on the new slot, against that slot's own frozen
+#      mirror.
 #
 # Unlike the driver repatch this must NEVER cancel an update: stock gamescope
 # boots fine, it just flickers at >1440p120 HDR. Callers treat rc!=0 as a
@@ -1073,9 +1089,11 @@ fail() { echo "[gs-repatch] FAIL: $*" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$DIR/gamescope.conf"
 : "${GS_REPO:?gamescope.conf missing GS_REPO}"
+: "${GS_TAG:?gamescope.conf missing GS_TAG}"
 : "${GS_COMMIT:?gamescope.conf missing GS_COMMIT}"
 : "${GS_ENV_FLAG:?gamescope.conf missing GS_ENV_FLAG}"
 BIN="$DIR/gamescope-gbm.bin"
+PATCHES="$DIR/gamescope-patches"
 [[ -f "$BIN" ]] || fail "prebuilt binary $BIN missing"
 
 ROOTDEV="/dev/disk/by-partsets/$PARTSET/rootfs"
@@ -1213,20 +1231,20 @@ if [[ ${#GS_FIX[@]} -gt 0 ]]; then
   fi
 fi
 
-log "Fetching pinned gamescope source $GS_COMMIT"
+compgen -G "$PATCHES/*.patch" >/dev/null || fail "no vendored patches in $PATCHES"
+log "Fetching gamescope $GS_TAG ($GS_COMMIT) and applying vendored patches"
+rm -rf "$MERGED/opt/gsbuild"
+mkdir -p "$MERGED/opt/gsbuild/patches"
+cp "$PATCHES"/*.patch "$MERGED/opt/gsbuild/patches/"
 in_chroot "set -e
-  rm -rf /opt/gsbuild && mkdir -p /opt/gsbuild && cd /opt/gsbuild
-  git init -q gamescope && cd gamescope
-  git remote add origin '$GS_REPO'
-  if git fetch -q --depth=1 origin '$GS_COMMIT'; then
-    git checkout -q FETCH_HEAD
-  else
-    # host refused fetch-by-sha — fall back to the branch tip
-    git fetch -q --depth=50 origin '$GS_BRANCH'
-    git checkout -q '$GS_COMMIT' || git checkout -q FETCH_HEAD
-  fi
+  cd /opt/gsbuild
+  git clone -q --depth=1 -b '$GS_TAG' '$GS_REPO' gamescope && cd gamescope
+  # a moved tag would no longer be what the patches were tested against
+  [ \"\$(git rev-parse HEAD)\" = '$GS_COMMIT' ]
   git submodule update --init --recursive --depth=1 || git submodule update --init --recursive
-" || fail "source fetch failed"
+  git -c user.name=steamos-nvidia-installer -c user.email=noreply@localhost \
+    am /opt/gsbuild/patches/*.patch
+" || fail "source fetch or patch apply failed"
 
 log "Building gamescope"
 in_chroot "cd /opt/gsbuild/gamescope && meson setup build --buildtype=release -Denable_tests=false && ninja -C build src/gamescope" \
@@ -1460,7 +1478,7 @@ cat <<EOF
 
   Driver:  nvidia-open (DKMS) $NVIDIA_VER for kernel $KVER
            (latest Arch at build time, pinned — Valve's mirror only has 575.x)
-$( if [[ $PATCH_GAMESCOPE -eq 1 ]]; then echo "  Gamescope: GBM-scanout fork $GS_BRANCH
+$( if [[ $PATCH_GAMESCOPE -eq 1 ]]; then echo "  Gamescope: $GS_TAG + GBM-scanout patches
            @ $GS_COMMIT
            (fixes the >1440p120 HDR flicker on NVIDIA; stock binary kept as
            /usr/bin/gamescope.stock, enabled via $GS_ENV_FLAG)"

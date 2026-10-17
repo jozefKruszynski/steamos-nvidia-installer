@@ -192,21 +192,24 @@ with scattered vidmem pages — the severe flicker/corruption at modes above
 [root cause](https://forums.developer.nvidia.com/t/display-modes-above-2560x1440p-120hz-with-hdr-enabled-cause-flickering-corruption-within-gamescope-session/295314/27)).
 
 By default the build compiles
-[NightHammer1000's `poc/gamescope-gbm-route`](https://github.com/NightHammer1000/gamescope/tree/poc/gamescope-gbm-route)
-gamescope — GBM-allocated (contiguous) scanout buffers, modeled on KWin —
-inside the same build chroot, so it links against the image's exact
-libraries. It replaces `/usr/bin/gamescope` (stock kept as
-`gamescope.stock`) and is activated by `gamescope_drm_gbm_scanout=1`,
-set in the image's `/etc/environment` and `/etc/environment.d/`. Remove
-that variable (or restore `gamescope.stock`) to revert on a live system.
-The commit actually built is pinned into
-`/usr/lib/steamos-nvidia/gamescope.conf` and the binary stored next to it,
-which is what the self-healing update path reinstalls.
+[Valve's gamescope](https://github.com/ValveSoftware/gamescope) at the tag
+in `GS_TAG` (currently `3.16.30`) with the patch series vendored in
+`patches/gamescope/<tag>/` applied via `git am` — GBM-allocated
+(contiguous) scanout buffers, modeled on KWin — inside the same build
+chroot, so it links against the image's exact libraries. It replaces
+`/usr/bin/gamescope` (stock kept as `gamescope.stock`) and is activated by
+`gamescope_drm_gbm_scanout=1`, set in the image's `/etc/environment` and
+`/etc/environment.d/`. Remove that variable (or restore `gamescope.stock`)
+to revert on a live system. The tag and its commit are pinned into
+`/usr/lib/steamos-nvidia/gamescope.conf`, with the built binary and the
+patches stored next to it (`gamescope-gbm.bin`, `gamescope-patches/`) —
+that is what the self-healing update path reinstalls or rebuilds from.
 
-Pass `--no-gamescope` for stock gamescope. Note the fork author recommends
-forcing composition for games that scan out directly (the branch does not
-force it yet), and `git`, `meson`, `ninja` and friends are pulled from the
-image's own frozen mirror — nothing from current Arch enters the image.
+Pass `--no-gamescope` for stock gamescope. Setting
+`gamescope_drm_gbm_force_composite=1` additionally forces composition, so
+client buffers are never scanned out directly (off by default). `git`,
+`meson`, `ninja` and friends are pulled from the image's own frozen mirror
+— nothing from current Arch enters the image.
 
 ## All options
 
