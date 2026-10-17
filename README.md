@@ -145,8 +145,11 @@ at `/usr/lib/steamos-nvidia/rauc-post-install.sh`, which runs Valve's own
 handler first. Every update path — Steam's atomupd D-Bus API,
 `atomupd-manager`, `holo-update` — installs through RAUC, so none can
 bypass it (Steam no longer calls `steamos-update`, which older builds of
-this script wrapped). The new slot is kept unbootable until its driver is
-in, so even a power cut during the rebuild leaves the current OS booting.
+this script wrapped). `fallback-system.conf`, which atomupd switches to
+after repeated failed updates, is hooked too when an image ships one. The
+new slot is kept unbootable until its driver is in, so even a power cut
+during the rebuild leaves the current OS booting; once it is, the boot
+config Valve's handler wrote is restored exactly as it was.
 Progress is logged with timestamps to `/var/log/steamos-nvidia-repatch.log`.
 
 The patched gamescope (see below) is reapplied to the new OS in the same

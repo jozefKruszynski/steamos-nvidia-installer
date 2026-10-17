@@ -951,13 +951,17 @@ grep -q 'rd.driver.blacklist=nouveau' "$NEWROOT/etc/default/grub" \
 # slot would lose its driver silently on the update after.
 mkdir -p "$NEWROOT/usr/lib/steamos-nvidia"
 cp -a /usr/lib/steamos-nvidia/. "$NEWROOT/usr/lib/steamos-nvidia/"
-SYSCONF="$NEWROOT/etc/rauc/system.conf"
+# atomupd switches to fallback-system.conf after repeated failed updates,
+# so hook that too when the image ships one.
 HOOK=/usr/lib/steamos-nvidia/rauc-post-install.sh
-if ! grep -qx "post-install=$HOOK" "$SYSCONF"; then
-  grep -qx 'post-install=/usr/lib/rauc/post-install.sh' "$SYSCONF" \
-    || die "unexpected post-install handler in $SYSCONF — cannot hook the next update"
-  sed -i "s|^post-install=/usr/lib/rauc/post-install.sh\$|post-install=$HOOK|" "$SYSCONF"
-fi
+for SYSCONF in "$NEWROOT/etc/rauc/system.conf" "$NEWROOT/etc/rauc/fallback-system.conf"; do
+  [[ "$SYSCONF" == */system.conf || -f "$SYSCONF" ]] || continue
+  if ! grep -qx "post-install=$HOOK" "$SYSCONF"; then
+    grep -qx 'post-install=/usr/lib/rauc/post-install.sh' "$SYSCONF" \
+      || die "unexpected post-install handler in $SYSCONF — cannot hook the next update"
+    sed -i "s|^post-install=/usr/lib/rauc/post-install.sh\$|post-install=$HOOK|" "$SYSCONF"
+  fi
+done
 log "RAUC post-install hook set in $PARTSET"
 [[ -f "$NEWROOT/usr/lib/systemd/system/steamos-finish-oobe-migration.service" ]] \
   && ln -sf /dev/null "$NEWROOT/etc/systemd/system/steamos-finish-oobe-migration.service"
@@ -1007,7 +1011,8 @@ REPATCH
 #      black screen, so it must stay unbootable even if this handler is
 #      killed or power is lost during the 10-20 min rebuild.
 #   3. Rebuild the driver into it. On success reapply the patched gamescope
-#      (non-fatal) and re-arm the slot exactly as Valve's handler did. On
+#      (non-fatal) and re-arm the slot by restoring the boot confs exactly
+#      as Valve's handler left them (snapshotted right after it ran). On
 #      failure report the install as failed; the current OS keeps booting.
 set -u
 VALVE=/usr/lib/rauc/post-install.sh
@@ -1035,8 +1040,16 @@ case "$THIS" in
   B) OTHER=A ;;
   *) say "booted slot '$THIS' is neither A nor B"; exit 1 ;;
 esac
-CONF=/esp/SteamOS/conf/$OTHER.conf
+CONFDIR=/esp/SteamOS/conf
+CONF=$CONFDIR/$OTHER.conf
+SNAP=/run/steamos-nvidia/bootconf
 [[ -f "$CONF" ]] || { say "boot config $CONF missing"; exit 1; }
+
+# Snapshot the boot state exactly as Valve's handler left it; the re-arm
+# restores this verbatim instead of re-deriving it, so any field Valve's
+# handler sets survives. All confs: set-mode may touch more than one.
+rm -rf "$SNAP"; mkdir -p "$SNAP"
+cp -p "$CONFDIR"/*.conf "$SNAP"/ || { say "cannot snapshot $CONFDIR"; exit 1; }
 
 # Editing the conf is what reliably steers the chainloader; set-mode booted
 # alone does NOT undo a staged switch (verified on hardware with the old
@@ -1064,11 +1077,22 @@ if [[ -x "$DIR/gamescope-repatch.sh" ]]; then
   fi
 fi
 
-# re-arm: the same call Valve's handler made before we disarmed the slot
-sed -i -e 's/^image-invalid:.*/image-invalid: 0/' "$CONF"
-holo-bootconf --image "$OTHER" set-mode first-boot
+# re-arm: put back exactly what Valve's handler wrote (tmp + rename per file)
+for f in "$SNAP"/*.conf; do
+  n="${f##*/}"
+  cp -p "$f" "$CONFDIR/.$n.new" && mv -f "$CONFDIR/.$n.new" "$CONFDIR/$n" \
+    || { say "!! restoring $CONFDIR/$n failed — slot $OTHER stays disarmed"; exit 1; }
+done
 sync -f "$CONF" 2>/dev/null || sync
 SELECTED="$(holo-bootconf selected-image)"
+if [[ "$SELECTED" != "$OTHER" ]]; then
+  # holo-bootconf keeps state outside the confs we restored; fall back to
+  # the call Valve's handler makes
+  say "restored boot confs but $SELECTED is selected — re-arming with set-mode first-boot"
+  holo-bootconf --image "$OTHER" set-mode first-boot
+  sync -f "$CONF" 2>/dev/null || sync
+  SELECTED="$(holo-bootconf selected-image)"
+fi
 say "slot $OTHER re-armed for first boot (next boot: $SELECTED)"
 [[ "$SELECTED" == "$OTHER" ]] \
   || say "!! slot $OTHER is ready but $SELECTED is still selected — the update will not apply on reboot"
@@ -1076,13 +1100,17 @@ exit 0
 HOOK
   chmod 755 "$MNT/usr/lib/steamos-nvidia/rauc-post-install.sh"
 
-  SYSCONF="$MNT/etc/rauc/system.conf"
+  # atomupd switches to fallback-system.conf after repeated failed updates,
+  # so hook that too when the image ships one.
   RAUC_HOOK=/usr/lib/steamos-nvidia/rauc-post-install.sh
-  if ! grep -qx "post-install=$RAUC_HOOK" "$SYSCONF"; then
-    grep -qx 'post-install=/usr/lib/rauc/post-install.sh' "$SYSCONF" \
-      || die "unexpected post-install handler in $SYSCONF — cannot hook OS updates"
-    sed -i "s|^post-install=/usr/lib/rauc/post-install.sh\$|post-install=$RAUC_HOOK|" "$SYSCONF"
-  fi
+  for SYSCONF in "$MNT/etc/rauc/system.conf" "$MNT/etc/rauc/fallback-system.conf"; do
+    [[ "$SYSCONF" == */system.conf || -f "$SYSCONF" ]] || continue
+    if ! grep -qx "post-install=$RAUC_HOOK" "$SYSCONF"; then
+      grep -qx 'post-install=/usr/lib/rauc/post-install.sh' "$SYSCONF" \
+        || die "unexpected post-install handler in $SYSCONF — cannot hook OS updates"
+      sed -i "s|^post-install=/usr/lib/rauc/post-install.sh\$|post-install=$RAUC_HOOK|" "$SYSCONF"
+    fi
+  done
 
   # ---- gamescope self-heal: pinned record + prebuilt binary + repatch tool.
   # Everything lives in /usr/lib/steamos-nvidia, which repatch.sh already
@@ -1538,6 +1566,9 @@ grep -q 'blacklist nouveau' "$MNT/etc/modprobe.d/99-nvidia-patch.conf" || die "m
 if [[ $UPDATE_MODE == selfheal ]]; then
   grep -qx 'post-install=/usr/lib/steamos-nvidia/rauc-post-install.sh' "$MNT/etc/rauc/system.conf" \
     || die "RAUC post-install hook not set in /etc/rauc/system.conf"
+  [[ ! -f "$MNT/etc/rauc/fallback-system.conf" ]] \
+    || grep -qx 'post-install=/usr/lib/steamos-nvidia/rauc-post-install.sh' "$MNT/etc/rauc/fallback-system.conf" \
+    || die "RAUC post-install hook not set in /etc/rauc/fallback-system.conf"
   [[ -x "$MNT/usr/lib/steamos-nvidia/rauc-post-install.sh" ]] || die "RAUC post-install handler missing"
   [[ -f "$MNT/usr/bin/steamos-update.orig" ]] && die "stale steamos-update wrapper left in the image"
   grep -q 'repatch' "$MNT/usr/lib/steamos-nvidia/repatch.sh" || die "repatch tool missing"
